@@ -1,70 +1,124 @@
+
 const express = require('express');
 const multer = require('multer');
-const { Storage } = require('@google-cloud/storage');
+const admin = require('firebase-admin');
 const path = require('path');
 
-// Initialize Express app and Google Cloud Storage client
+// ✅ Initialize Firebase Admin SDK
+const serviceAccount = require(path.resolve(__dirname, 'C:/Users/FUJISU/Desktop/rrroott/alphie/alphie3000-firebase-adminsdk-fbsvc-2fd09baecd.json'));
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  storageBucket: 'alphie3000.appspot.com'
+});
+
+const db = admin.firestore();
+const bucket = admin.storage().bucket();
+
 const app = express();
-const storage = new Storage({ keyFilename: 'C:\Users\FUJISU\Desktop\rrroott\alphie\video-upload-backend\forward-script-449523-v6-97a4dc96990c.json' }); // Use the path to your JSON key
-const bucket = storage.bucket('alphie'); // Replace with your bucket name
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Set up multer for handling file uploads
 const upload = multer({
-  storage: multer.memoryStorage(), // Store files temporarily in memory
-  limits: { fileSize: 100 * 1024 * 1024 }, // Max file size (100 MB)
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 } // 100MB max
 });
 
-// POST endpoint to upload video
-app.post('/upload', upload.single('video'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).send('No file uploaded.');
-  }
+// ✅ Upload Video Endpoint
+app.post('/upload', upload.single('video'), async (req, res) => {
+  const { file } = req;
+  const { userId, username, title, description } = req.body;
 
-  // Create a unique file name using timestamp
-  const fileName = Date.now() + path.extname(req.file.originalname);
-  const file = bucket.file(fileName);
-  
-  // Create a writable stream to Google Cloud Storage
-  const blobStream = file.createWriteStream({
+  if (!file) return res.status(400).send('No file uploaded.');
+  if (!userId || !username) return res.status(400).send('User ID and username are required.');
+
+  const fileName = `videos/${Date.now()}-${file.originalname}`;
+  const videoFile = bucket.file(fileName);
+
+  const blobStream = videoFile.createWriteStream({
     resumable: false,
-    contentType: req.file.mimetype,
+    metadata: { contentType: file.mimetype }
   });
 
-  // When the upload finishes, make the file public and send back the URL
-  blobStream.on('finish', () => {
-    file.makePublic().then(() => {
-      const publicUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
-      return res.status(200).json({ videoUrl: publicUrl }); // Send video URL as response
-    });
-  });
-
-  // Handle any errors
   blobStream.on('error', (err) => {
-    console.error('Error uploading file:', err);
-    return res.status(500).send('Error uploading file.');
+    console.error('❌ Stream error:', err);
+    res.status(500).send(`Error uploading: ${err.message}`);
   });
 
-  // Upload the file buffer to Cloud Storage
-  blobStream.end(req.file.buffer);
-});
+  blobStream.on('finish', async () => {
+    try {
+      // Make the file public and get URL
+      await videoFile.makePublic();
+      const downloadURL = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
 
-// GET endpoint to retrieve video URL by file name
-app.get('/video/:videoName', (req, res) => {
-  const videoName = req.params.videoName;
-  const file = bucket.file(videoName);
+      // ✅ Save everything under the videos collection
+      const videoData = {
+        user: {
+          id: userId,
+          username: username
+        },
+        title: title || 'Untitled',
+        description: description || 'No description',
+        storagePath: fileName,
+        downloadURL,
+        comments: 0,
+        likes: 0,
+        dislikes: 0,
+        hearts: 0,
+        money: 0,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+      };
 
-  file.exists().then(([exists]) => {
-    if (!exists) {
-      return res.status(404).send('Video not found');
+      const docRef = await db.collection('videos').add(videoData);
+      res.status(200).json({ id: docRef.id, ...videoData });
+
+    } catch (error) {
+      console.error('❌ Upload error:', error);
+      res.status(500).json({ error: `Error saving metadata: ${error.message}` });
     }
-
-    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${videoName}`;
-    return res.status(200).json({ videoUrl: publicUrl });
   });
+
+  blobStream.end(file.buffer);
 });
 
-// Start the server
-const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// ✅ Fetch All Videos Endpoint
+app.get('/videos', async (req, res) => {
+  try {
+    const snapshot = await db.collection('videos').orderBy('timestamp', 'desc').get();
+    if (snapshot.empty) return res.status(200).json([]);
+    const videos = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json(videos);
+  } catch (error) {
+    res.status(500).json({ error: `Error fetching videos: ${error.message}` });
+  }
 });
+
+// ✅ Rank Users by Likes
+app.get('/ranked-users', async (req, res) => {
+  try {
+    const snapshot = await db.collection('videos').get();
+    if (snapshot.empty) return res.status(200).json([]);
+
+    const userStats = {};
+    snapshot.docs.forEach(doc => {
+      const { user, likes = 0 } = doc.data();
+      if (!user || !user.id) return;
+
+      if (!userStats[user.id]) {
+        userStats[user.id] = { username: user.username, likes: 0 };
+      }
+      userStats[user.id].likes += likes;
+    });
+
+    const rankedUsers = Object.entries(userStats)
+      .map(([userId, stats]) => ({ userId, ...stats }))
+      .sort((a, b) => b.likes - a.likes);
+
+    res.status(200).json(rankedUsers);
+  } catch (error) {
+    res.status(500).json({ error: `Error ranking users: ${error.message}` });
+  }
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
